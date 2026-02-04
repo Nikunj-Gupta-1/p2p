@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""
+Single-file P2P Encrypted Chat with GUI.
+
+- Keeps original raw TCP design: server listens on a TCP port, clients connect to host:port.
+- Port-forwarding / NAT behavior is unchanged compared to the original script.
+- Multi-peer server with per-peer encrypted sessions and padding.
+- Tkinter GUI on top: no logs go to the terminal; everything is shown in the GUI.
+
+Requires:
+    pip install pycryptodome
+"""
+
+# =========================
+# === Original crypto + P2P logic (adapted for GUI logging) ===
+# =========================
+
+import socket
+import threading
+import sys
+import os
+import pickle
+import hashlib
+import hmac
+import secrets
+import time
+import queue
+from dataclasses import dataclass
+
+from Crypto.Cipher import AES
+from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Signature import pkcs1_15
+from Crypto.Hash import SHA256
+
+
+def sha256(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+def kdf(shared_secret_int: int, context: bytes) -> bytes:
+    return sha256(str(shared_secret_int).encode() + b"|" + context)
+
+
+class CryptoManager:
+    """
+    Identity keypair + DH primitives.
+    """
+    DH_PRIME = int(
+        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+        "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+        "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+        "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+        "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+        "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+        "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+        "670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF",
+        16,
+    )
+    DH_GENERATOR = 2
+
+    def __init__(self, key_file: str = "my_key.pem"):
+        self.key_file = key_file
+        self.private_key = None
+        self.public_key = None
+        self._load_or_generate_rsa()
+
+    def _load_or_generate_rsa(self):
+        if os.path.exists(self.key_file):
+            # Log only via GUI, so no print here
+            with open(self.key_file, "rb") as f:
+                self.private_key = RSA.import_key(f.read())
+        else:
+            self.private_key = RSA.generate(2048)
+            with open(self.key_file, "wb") as f:
+                f.write(self.private_key.export_key())
+        self.public_key = self.private_key.publickey()
+
+    def public_bytes(self) -> bytes:
+        return self.public_key.export_key()
+
+    def sign_int(self, value: int) -> bytes:
+        h = SHA256.new(str(value).encode())
+        return pkcs1_15.new(self.private_key).sign(h)
+
+    @staticmethod
+    def verify_int(peer_rsa_pub: RSA.RsaKey, value: int, signature: bytes) -> bool:
+        h = SHA256.new(str(value).encode())
+        try:
+            pkcs1_15.new(peer_rsa_pub).verify(h, signature)
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    def dh_generate(self):
+        priv = secrets.randbelow(self.DH_PRIME - 2) + 1
+        pub = pow(self.DH_GENERATOR, priv, self.DH_PRIME)
+        return priv, pub
+
+    def dh_shared(self, my_priv: int, peer_pub: int) -> int:
+        return pow(peer_pub, my_priv, self.DH_PRIME)
+
+
+class SessionCrypto:
+    """
+    Per-connection crypto state: peer key, derived keys, counters, encrypt/decrypt.
+    """
+    def __init__(self, identity: CryptoManager):
+        self.identity = identity
+        self.peer_public_key = None
+
+        self.enc_key = None
+        self.mac_key = None
+
+        self.send_counter = 0
+        self.recv_counter = 0
+
+    def set_peer_public_key(self, key_bytes: bytes):
+        self.peer_public_key = RSA.import_key(key_bytes)
+
+    def derive_from_shared(self, shared_secret_int: int):
+        self.enc_key = kdf(shared_secret_int, b"enc_key")
+        self.mac_key = kdf(shared_secret_int, b"mac_key")
+        self.send_counter = 0
+        self.recv_counter = 0
+
+    def _mac(self, counter: int, iv: bytes, ciphertext: bytes) -> bytes:
+        auth = counter.to_bytes(8, "big") + iv + ciphertext
+        return hmac.new(self.mac_key, auth, hashlib.sha256).digest()
+
+    def encrypt_record(self, payload: bytes, is_dummy: bool) -> bytes:
+        self.send_counter += 1
+        cipher = AES.new(self.enc_key, AES.MODE_CBC)
+        ct = cipher.encrypt(pad(payload, AES.block_size))
+        tag = self._mac(self.send_counter, cipher.iv, ct)
+
+        rec = {
+            "counter": self.send_counter,
+            "iv": cipher.iv,
+            "ciphertext": ct,
+            "mac": tag,
+            "is_dummy": bool(is_dummy),
+        }
+        return pickle.dumps(rec, protocol=4)
+
+    def decrypt_record(self, data: bytes):
+        rec = pickle.loads(data)
+
+        counter = int(rec["counter"])
+        iv = rec["iv"]
+        ct = rec["ciphertext"]
+        mac = rec["mac"]
+
+        expected = self._mac(counter, iv, ct)
+        if not hmac.compare_digest(expected, mac):
+            raise ValueError("HMAC verification failed")
+        if counter <= self.recv_counter:
+            raise ValueError("Replay/out-of-order detected")
+        self.recv_counter = counter
+
+        if rec.get("is_dummy", False):
+            return True, b""
+
+        cipher = AES.new(self.enc_key, AES.MODE_CBC, iv)
+        pt = unpad(cipher.decrypt(ct), AES.block_size)
+        return False, pt
+
+
+def send_framed(conn: socket.socket, payload: bytes, lock: threading.Lock | None = None):
+    data = len(payload).to_bytes(4, "big") + payload
+    if lock:
+        with lock:
+            conn.sendall(data)
+    else:
+        conn.sendall(data)
+
+
+def recv_exact(conn: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        buf += chunk
+    return buf
+
+
+def recv_framed(conn: socket.socket) -> bytes:
+    length = int.from_bytes(recv_exact(conn, 4), "big")
+    return recv_exact(conn, length)
+
+
+@dataclass
+class SessionConfig:
+    packet_interval: float = 0.1   # 10 pkt/s when active
+    idle_threshold: float = 5.0    # stop padding after idle
+    dummy_len: int = 64            # bytes of dummy plaintext
+
+
+class PeerSession:
+    """
+    One TCP connection <-> one peer.
+    """
+    def __init__(self, conn: socket.socket, addr, identity: CryptoManager, config: SessionConfig, on_message, on_log):
+        self.conn = conn
+        self.addr = addr
+        self.identity = identity
+        self.cfg = config
+        self.on_message = on_message
+        self.on_log = on_log
+
+        self.running = False
+        self.send_lock = threading.Lock()
+
+        self.crypto = SessionCrypto(identity)
+        self.out_q = queue.Queue()
+        self.last_real_sent = time.time()
+
+        self.peer_id = f"{addr[0]}:{addr[1]}"
+
+    def log(self, msg: str):
+        if self.on_log:
+            self.on_log(f"[{self.peer_id}] {msg}")
+
+    # ---- handshake ----
+
+    def handshake_server(self):
+        send_framed(self.conn, self.identity.public_bytes(), self.send_lock)
+        peer_rsa = recv_framed(self.conn)
+        self.crypto.set_peer_public_key(peer_rsa)
+
+        my_priv, my_pub = self.identity.dh_generate()
+        my_sig = self.identity.sign_int(my_pub)
+        send_framed(self.conn, pickle.dumps({"dh": my_pub, "sig": my_sig}, protocol=4), self.send_lock)
+
+        peer_blob = recv_framed(self.conn)
+        peer = pickle.loads(peer_blob)
+        peer_pub = int(peer["dh"])
+        peer_sig = peer["sig"]
+
+        if not CryptoManager.verify_int(self.crypto.peer_public_key, peer_pub, peer_sig):
+            raise ConnectionError("Handshake failed: invalid peer DH signature")
+
+        shared = self.identity.dh_shared(my_priv, peer_pub)
+        self.crypto.derive_from_shared(shared)
+        self.log("Secure session established (server side).")
+
+    def handshake_client(self):
+        peer_rsa = recv_framed(self.conn)
+        self.crypto.set_peer_public_key(peer_rsa)
+        send_framed(self.conn, self.identity.public_bytes(), self.send_lock)
+
+        server_blob = recv_framed(self.conn)
+        server = pickle.loads(server_blob)
+        server_pub = int(server["dh"])
+        server_sig = server["sig"]
+
+        if not CryptoManager.verify_int(self.crypto.peer_public_key, server_pub, server_sig):
+            raise ConnectionError("Handshake failed: invalid server DH signature")
+
+        my_priv, my_pub = self.identity.dh_generate()
+        my_sig = self.identity.sign_int(my_pub)
+        send_framed(self.conn, pickle.dumps({"dh": my_pub, "sig": my_sig}, protocol=4), self.send_lock)
+
+        shared = self.identity.dh_shared(my_priv, server_pub)
+        self.crypto.derive_from_shared(shared)
+        self.log("Secure session established (client side).")
+
+    # ---- loops ----
+
+    def start(self):
+        self.running = True
+        threading.Thread(target=self._recv_loop, daemon=True).start()
+        threading.Thread(target=self._padded_send_loop, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.log("Session closed.")
+
+    def enqueue_message(self, text: str):
+        self.out_q.put(text)
+
+    def _send_record(self, rec_bytes: bytes):
+        send_framed(self.conn, rec_bytes, self.send_lock)
+
+    def _send_real(self, text: str):
+        rec = self.crypto.encrypt_record(text.encode("utf-8"), is_dummy=False)
+        self._send_record(rec)
+        self.last_real_sent = time.time()
+
+    def _send_dummy(self):
+        rec = self.crypto.encrypt_record(secrets.token_bytes(self.cfg.dummy_len), is_dummy=True)
+        self._send_record(rec)
+
+    def _padded_send_loop(self):
+        while self.running:
+            now = time.time()
+            active = (now - self.last_real_sent) <= self.cfg.idle_threshold
+
+            if not active:
+                try:
+                    msg = self.out_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                self._send_real(msg)
+                continue
+
+            tick = time.time()
+            try:
+                msg = self.out_q.get_nowait()
+                self._send_real(msg)
+            except queue.Empty:
+                self._send_dummy()
+
+            elapsed = time.time() - tick
+            time.sleep(max(0.0, self.cfg.packet_interval - elapsed))
+
+    def _recv_loop(self):
+        try:
+            while self.running:
+                blob = recv_framed(self.conn)
+                is_dummy, pt = self.crypto.decrypt_record(blob)
+                if not is_dummy:
+                    msg = pt.decode("utf-8", errors="replace")
+                    if self.on_message:
+                        self.on_message(self.peer_id, msg)
+        except Exception as e:
+            self.log(f"Recv loop error: {e}")
+        finally:
+            self.stop()
+
+
+class MultiPeerServer:
+    def __init__(self, identity: CryptoManager, host="0.0.0.0", port=9999):
+        self.identity = identity
+        self.host = host
+        self.port = port
+        self.cfg = SessionConfig()
+
+        self.sock = None
+        self.running = False
+
+        self.sessions: dict[str, PeerSession] = {}
+        self.sessions_lock = threading.Lock()
+
+        # Hooks for GUI:
+        self.on_log = None
+        self.on_peer_list_changed = None
+
+    def log(self, text: str):
+        if self.on_log:
+            self.on_log(text)
+
+    def start(self):
+        self.running = True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(50)
+
+        self.log(f"[*] Server listening on {self.host}:{self.port}")
+        self.log("[*] Accepting multiple peers. Select a peer to send direct messages.")
+
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while self.running:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._handle_new_peer, args=(conn, addr), daemon=True).start()
+
+    def _handle_new_peer(self, conn, addr):
+        def on_msg(peer_id, msg):
+            self.log(f"{peer_id} says: {msg}")
+
+        session = PeerSession(conn, addr, self.identity, self.cfg, on_msg, self.on_log)
+        try:
+            session.handshake_server()
+        except Exception as e:
+            self.log(f"[!] Handshake error from {addr}: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+
+        with self.sessions_lock:
+            self.sessions[session.peer_id] = session
+
+        self.log(f"[+] Peer connected: {session.peer_id}")
+        if self.on_peer_list_changed:
+            self.on_peer_list_changed(list(self.sessions.keys()))
+        session.start()
+
+    def broadcast(self, text: str):
+        with self.sessions_lock:
+            dead = []
+            for peer_id, sess in self.sessions.items():
+                if sess.running:
+                    sess.enqueue_message(text)
+                else:
+                    dead.append(peer_id)
+            for peer_id in dead:
+                self.sessions.pop(peer_id, None)
+        if dead and self.on_peer_list_changed:
+            self.on_peer_list_changed(list(self.sessions.keys()))
+
+    def send_to_peer(self, peer_id: str, text: str):
+        with self.sessions_lock:
+            sess = self.sessions.get(peer_id)
+        if sess and sess.running:
+            sess.enqueue_message(text)
+        else:
+            self.log(f"[!] Peer {peer_id} not available.")
+
+    def stop(self):
+        self.running = False
+        with self.sessions_lock:
+            for sess in list(self.sessions.values()):
+                sess.stop()
+            self.sessions.clear()
+
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+
+        self.log("[*] Server stopped")
+        if self.on_peer_list_changed:
+            self.on_peer_list_changed([])
+
+
+class SimpleClient:
+    def __init__(self, identity: CryptoManager, host: str, port: int = 9999):
+        self.identity = identity
+        self.host = host
+        self.port = port
+        self.cfg = SessionConfig()
+
+        self.session: PeerSession | None = None
+        self.on_log = None
+        self.on_connected = None
+        self.on_disconnected = None
+
+    def log(self, text: str):
+        if self.on_log:
+            self.on_log(text)
+
+    def connect_once(self):
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.log(f"[*] Connecting to {self.host}:{self.port}...")
+        conn.connect((self.host, self.port))
+        self.log("[✓] Connected")
+
+        def on_msg(peer_id, msg):
+            self.log(f"Peer: {msg}")
+
+        session = PeerSession(conn, (self.host, self.port), self.identity, self.cfg, on_msg, self.on_log)
+        session.peer_id = f"{self.host}:{self.port}"
+
+        session.handshake_client()
+        self.log("[✓] Secure channel established.")
+        session.start()
+
+        self.session = session
+        if self.on_connected:
+            self.on_connected()
+
+        threading.Thread(target=self._monitor_session, daemon=True).start()
+
+    def _monitor_session(self):
+        while self.session and self.session.running:
+            time.sleep(0.2)
+        if self.on_disconnected:
+            self.on_disconnected()
+
+    def send(self, text: str):
+        if self.session and self.session.running:
+            self.session.enqueue_message(text)
+
+    def disconnect(self):
+        if self.session:
+            self.session.stop()
+            self.session = None
+
+
+# =========================
+# === Tkinter GUI ===
+# =========================
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+class GUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("P2P Encrypted Chat (Desktop)")
+        self.geometry("1000x650")
+        self.minsize(950, 600)
+
+        self.identity = CryptoManager()
+        self.server: MultiPeerServer | None = None
+        self.client: SimpleClient | None = None
+
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(self, padding=12)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(10, weight=1)
+
+        self.mode = tk.StringVar(value="server")
+        ttk.Label(top, text="Mode:").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(top, text="Server", value="server", variable=self.mode,
+                        command=self._refresh_mode).grid(row=0, column=1, padx=(6, 0))
+        ttk.Radiobutton(top, text="Client", value="client", variable=self.mode,
+                        command=self._refresh_mode).grid(row=0, column=2, padx=(6, 12))
+
+        self.port_var = tk.StringVar(value="9999")
+        ttk.Label(top, text="Port:").grid(row=0, column=3, sticky="e")
+        self.port_entry = ttk.Entry(top, width=10, textvariable=self.port_var)
+        self.port_entry.grid(row=0, column=4, sticky="w", padx=(6, 0))
+
+        self.host_var = tk.StringVar(value="")
+        self.host_label = ttk.Label(top, text="Peer host:")
+        self.host_entry = ttk.Entry(top, width=24, textvariable=self.host_var)
+
+        self.start_btn = ttk.Button(top, text="Start", command=self.start_mode)
+        self.stop_btn = ttk.Button(top, text="Stop", command=self.stop_all)
+        self.start_btn.grid(row=0, column=5, padx=(16, 6))
+        self.stop_btn.grid(row=0, column=6, padx=(0, 6))
+
+        self.status = tk.StringVar(value="Stopped")
+        ttk.Label(top, textvariable=self.status, foreground="#0ea5e9").grid(
+            row=1, column=0, columnspan=11, sticky="w", pady=(10, 0)
+        )
+
+        main = ttk.Frame(self, padding=(12, 0, 12, 12))
+        main.grid(row=1, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=3)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        # Left: log + input
+        left = ttk.Frame(main)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+
+        ttk.Label(left, text="Log:").grid(row=0, column=0, sticky="w")
+        self.log = tk.Text(left, wrap="word", height=20)
+        self.log.grid(row=1, column=0, sticky="nsew", pady=(6, 10))
+        self.log.configure(state="disabled")
+
+        input_frame = ttk.Frame(left)
+        input_frame.grid(row=2, column=0, sticky="ew")
+        input_frame.columnconfigure(0, weight=1)
+
+        self.msg_var = tk.StringVar()
+        self.msg_entry = ttk.Entry(input_frame, textvariable=self.msg_var)
+        self.msg_entry.grid(row=0, column=0, sticky="ew")
+        self.send_btn = ttk.Button(input_frame, text="Send", command=self.send_msg)
+        self.send_btn.grid(row=0, column=1, padx=(8, 0))
+        self.msg_entry.bind("<Return>", lambda e: self.send_msg())
+
+        # Right: peers + info
+        right = ttk.Frame(main)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(3, weight=1)
+
+        ttk.Label(right, text="Connected peers (server mode):").grid(row=0, column=0, sticky="w")
+        self.peer_list = tk.Listbox(right, height=8, exportselection=False)
+        self.peer_list.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
+        self.peer_list_scroll = ttk.Scrollbar(right, orient="vertical", command=self.peer_list.yview)
+        self.peer_list.configure(yscrollcommand=self.peer_list_scroll.set)
+        self.peer_list_scroll.grid(row=1, column=1, sticky="ns")
+
+        self.peer_mode_var = tk.StringVar(value="broadcast")
+        peer_mode_frame = ttk.Frame(right)
+        peer_mode_frame.grid(row=2, column=0, sticky="ew", pady=(4, 8))
+        ttk.Radiobutton(peer_mode_frame, text="Broadcast", value="broadcast",
+                        variable=self.peer_mode_var).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(peer_mode_frame, text="Selected peer", value="selected",
+                        variable=self.peer_mode_var).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        ttk.Label(right, text="Notes:").grid(row=3, column=0, sticky="w")
+        self.notes = tk.Text(right, wrap="word", height=10)
+        self.notes.grid(row=4, column=0, sticky="nsew", pady=(4, 0))
+        self.notes.insert(
+            "1.0",
+            "This GUI does NOT change networking.\n"
+            "Server listens on TCP port, clients connect to host:port.\n"
+            "Port-forward that TCP port on your router for Internet use.\n\n"
+            "Server mode:\n"
+            "- Start server on chosen port.\n"
+            "- Peers appear in the list as they connect.\n"
+            "- Choose Broadcast to message all peers.\n"
+            "- Choose Selected peer to send only to one.\n\n"
+            "Client mode:\n"
+            "- Enter server public IP/hostname and port.\n"
+            "- Start and chat; messages go to the server.\n"
+        )
+        self.notes.configure(state="disabled")
+
+        self._refresh_mode()
+        self._set_running(False)
+
+    def _set_running(self, running: bool):
+        self.start_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+        self.send_btn.configure(state="normal" if running else "disabled")
+        self.msg_entry.configure(state="normal" if running else "disabled")
+
+    def _refresh_mode(self):
+        if self.mode.get() == "client":
+            self.host_label.grid(row=0, column=7, sticky="e", padx=(10, 0))
+            self.host_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
+        else:
+            self.host_label.grid_forget()
+            self.host_entry.grid_forget()
+
+    def _append_log(self, line: str):
+        self.log.configure(state="normal")
+        self.log.insert("end", line + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _update_peer_list(self, peers: list[str]):
+        self.peer_list.delete(0, "end")
+        for p in peers:
+            self.peer_list.insert("end", p)
+
+    def start_mode(self):
+        try:
+            port = int(self.port_var.get().strip() or "9999")
+        except ValueError:
+            messagebox.showerror("Invalid port", "Port must be a number.")
+            return
+
+        mode = self.mode.get()
+        self.stop_all()
+
+        if mode == "server":
+            self.server = MultiPeerServer(self.identity, port=port)
+            self.server.on_log = lambda s: self.after(0, self._append_log, s)
+            self.server.on_peer_list_changed = lambda peers: self.after(0, self._update_peer_list, peers)
+            self.server.start()
+            self.status.set(f"Server running on 0.0.0.0:{port}. Forward this TCP port for WAN.")
+            self._set_running(True)
+        else:
+            host = self.host_var.get().strip()
+            if not host:
+                messagebox.showerror("Missing host", "Enter the peer/server host (public IP or hostname).")
+                return
+            self.client = SimpleClient(self.identity, host, port=port)
+            self.client.on_log = lambda s: self.after(0, self._append_log, s)
+            self.client.on_connected = lambda: self.after(0, self.status.set, f"Connected to {host}:{port}.")
+            self.client.on_disconnected = lambda: self.after(0, self.status.set, "Disconnected.")
+            try:
+                self.client.connect_once()
+            except Exception as e:
+                self._append_log(f"[!] Connection error: {e}")
+                self.status.set("Connection failed.")
+                self._set_running(False)
+                self.client = None
+                return
+            self._set_running(True)
+
+    def send_msg(self):
+        text = self.msg_var.get()
+        if not text.strip():
+            return
+        self.msg_var.set("")
+
+        if text.strip().lower() == "quit":
+            self.stop_all()
+            return
+
+        if self.server:
+            if self.peer_mode_var.get() == "selected":
+                sel = self.peer_list.curselection()
+                if not sel:
+                    messagebox.showinfo("No peer selected", "Select a peer in the list, or choose Broadcast.")
+                    return
+                peer_id = self.peer_list.get(sel[0])
+                self.server.send_to_peer(peer_id, text)
+                self._append_log(f"You -> {peer_id}: {text}")
+            else:
+                self.server.broadcast(text)
+                self._append_log(f"You (broadcast): {text}")
+        elif self.client:
+            self.client.send(text)
+            self._append_log(f"You: {text}")
+
+    def stop_all(self):
+        if self.client:
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+        if self.server:
+            try:
+                self.server.stop()
+            except Exception:
+                pass
+            self.server = None
+        self._update_peer_list([])
+        self.status.set("Stopped")
+        self._set_running(False)
+
+    def _on_close(self):
+        try:
+            self.stop_all()
+        finally:
+            self.destroy()
+
+
+def main():
+    app = GUI()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
