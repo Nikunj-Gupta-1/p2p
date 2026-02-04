@@ -1,4 +1,4 @@
 # p2p
 a simple p2p connection for messaging
-## add a port ip:
-https://305nr3rr-9999.inc1.devtunnels.ms/
+use port forwarding for connection over internet
+can be done using ngrok if no router access is availible
