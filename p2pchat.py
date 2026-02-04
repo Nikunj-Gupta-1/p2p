@@ -182,7 +182,7 @@ class SessionCrypto:
 # Socket framing (length-prefixed)
 # ---------------------------
 
-def send_framed(conn: socket.socket, payload: bytes, lock: threading.Lock | None = None):
+def send_framed(conn: socket.socket, payload: bytes, lock: threading.Lock = None):
     data = len(payload).to_bytes(4, "big") + payload
     if lock:
         with lock:
