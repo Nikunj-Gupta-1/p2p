@@ -222,7 +222,7 @@ class PeerSession:
         self.out_q = queue.Queue()
         self.last_real_sent = time.time()
 
-        self.peer_username = peer_username  # logical name
+        self.peer_username = peer_username
         self.peer_id = f"{peer_username} ({addr[0]}:{addr[1]})"
 
     def log(self, msg: str):
@@ -288,7 +288,11 @@ class PeerSession:
         self.out_q.put(text)
 
     def _send_record(self, rec_bytes: bytes):
-        send_framed(self.conn, rec_bytes, self.send_lock)
+        # FIX: avoid BrokenPipeError when peer is gone
+        try:
+            send_framed(self.conn, rec_bytes, self.send_lock)
+        except (BrokenPipeError, OSError):
+            self.running = False
 
     def _send_real(self, text: str):
         rec = self.crypto.encrypt_record(text.encode("utf-8"), is_dummy=False)
@@ -351,7 +355,6 @@ class MultiPeerServer:
         self.username = username
         self.password_hash = None
         if password_plain:
-            # HMAC-SHA256(password, salt) – simple keyed hash
             salt = b"p2pchat-room"
             self.password_hash = hmac.new(salt, password_plain.encode(), hashlib.sha256).hexdigest()
 
@@ -370,7 +373,6 @@ class MultiPeerServer:
 
     def _check_password(self, received_plain: str) -> bool:
         if self.password_hash is None:
-            # No password set => allow all
             return True
         salt = b"p2pchat-room"
         trial = hmac.new(salt, received_plain.encode(), hashlib.sha256).hexdigest()
@@ -399,11 +401,11 @@ class MultiPeerServer:
     def _auth_and_handle_peer(self, conn, addr):
         ip = addr[0]
         try:
-            # 1) Receive username (UTF-8, framed).
+            # 1) username
             uname_bytes = recv_framed(conn)
             peer_username = uname_bytes.decode("utf-8", errors="replace") or f"{ip}"
 
-            # 2) Password attempts (max 3).
+            # 2) password attempts
             attempts = 0
             authenticated = False
             while attempts < 3:
@@ -427,7 +429,6 @@ class MultiPeerServer:
                 conn.close()
                 return
 
-            # 3) Proceed to crypto handshake + session.
             def on_msg(peer_id, msg):
                 self.log(f"{peer_id} says: {msg}")
 
@@ -512,7 +513,7 @@ class SimpleClient:
         self.on_log = None
         self.on_connected = None
         self.on_disconnected = None
-        self.on_auth_fail_3 = None  # callback when 3 attempts fail (GUI will exit)
+        self.on_auth_fail_3 = None
 
     def log(self, text: str):
         if self.on_log:
@@ -524,10 +525,10 @@ class SimpleClient:
         conn.connect((self.host, self.port))
         self.log("[*] Connected, sending username and password...")
 
-        # 1) Send username
+        # send username
         send_framed(conn, self.username.encode("utf-8"))
 
-        # 2) Password attempts (max 3) - we simply retry same password 3 times
+        # 3 attempts on same password
         attempts = 0
         while attempts < 3:
             send_framed(conn, self.password.encode("utf-8"))
@@ -555,7 +556,7 @@ class SimpleClient:
                 conn.close()
                 return
 
-        # 3) Crypto handshake + session
+        # handshake + session
         def on_msg(peer_id, msg):
             self.log(f"{peer_id}: {msg}")
 
@@ -798,7 +799,6 @@ class GUI(tk.Tk):
             self._set_running(True)
 
     def _client_auth_lockout(self):
-        # Called from client thread after 3 failed attempts
         def _do():
             self._append_log("[!] Client is shutting down after 3 failed password attempts.")
             self.stop_all()
