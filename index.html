@@ -1,0 +1,635 @@
+                
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P Encrypted Chat</title>
+    <style>
+        :root {
+            --color-bg: #0f172a;
+            --color-surface: #1e293b;
+            --color-surface-elevated: #334155;
+            --color-text: #f1f5f9;
+            --color-text-secondary: #cbd5e1;
+            --color-text-muted: #94a3b8;
+            --color-primary: #38bdf8;
+            --color-primary-hover: #0ea5e9;
+            --color-success: #10b981;
+            --color-warning: #f59e0b;
+            --color-error: #ef4444;
+            --color-border: rgba(148, 163, 184, 0.2);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--color-bg);
+            color: var(--color-text);
+            line-height: 1.6;
+            min-height: 100vh;
+            overflow-y: auto;
+        }
+
+        .login-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .login-box {
+            background: var(--color-surface);
+            padding: 2.5rem;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 400px;
+            border: 1px solid var(--color-border);
+        }
+
+        .login-box h1 {
+            color: var(--color-primary);
+            margin-bottom: 0.5rem;
+            font-size: 1.8rem;
+        }
+
+        .login-box p {
+            color: var(--color-text-muted);
+            margin-bottom: 2rem;
+            font-size: 0.9rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--color-text-secondary);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 0.75rem;
+            background: var(--color-surface-elevated);
+            border: 1px solid var(--color-border);
+            border-radius: 6px;
+            color: var(--color-text);
+            font-size: 0.95rem;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--color-primary);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 0.875rem;
+            background: var(--color-primary);
+            color: var(--color-bg);
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn:hover {
+            background: var(--color-primary-hover);
+        }
+
+        .error-message {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--color-error);
+            padding: 0.75rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        .success-message {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--color-success);
+            padding: 0.75rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .chat-container {
+            display: none;
+            height: 100vh;
+            flex-direction: column;
+        }
+
+        .chat-container.active {
+            display: flex;
+        }
+
+        .chat-header {
+            background: var(--color-surface);
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--color-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .chat-header h2 {
+            color: var(--color-primary);
+            font-size: 1.3rem;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--color-text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--color-success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1.5rem;
+            background: var(--color-bg);
+            min-height: 0;
+        }
+
+        .message {
+            margin-bottom: 1rem;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .message-username {
+            font-weight: 600;
+            color: var(--color-primary);
+            font-size: 0.9rem;
+        }
+
+        .message-time {
+            font-size: 0.75rem;
+            color: var(--color-text-muted);
+        }
+
+        .message-content {
+            background: var(--color-surface);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            color: var(--color-text-secondary);
+            word-wrap: break-word;
+            max-width: 70%;
+        }
+
+        .message.own .message-content {
+            background: var(--color-primary);
+            color: var(--color-bg);
+            margin-left: auto;
+        }
+
+        .message.own .message-username {
+            color: var(--color-success);
+        }
+
+        .message.system {
+            text-align: center;
+        }
+
+        .message.system .message-content {
+            background: transparent;
+            color: var(--color-text-muted);
+            font-style: italic;
+            font-size: 0.85rem;
+            max-width: 100%;
+        }
+
+        .chat-input-container {
+            background: var(--color-surface);
+            padding: 1rem 1.5rem;
+            border-top: 1px solid var(--color-border);
+            display: flex;
+            gap: 1rem;
+            flex-shrink: 0;
+        }
+
+        .chat-input-container input {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            background: var(--color-surface-elevated);
+            border: 1px solid var(--color-border);
+            border-radius: 6px;
+            color: var(--color-text);
+            font-size: 0.95rem;
+        }
+
+        .chat-input-container input:focus {
+            outline: none;
+            border-color: var(--color-primary);
+        }
+
+        .chat-input-container button {
+            padding: 0.75rem 1.5rem;
+            background: var(--color-primary);
+            color: var(--color-bg);
+            border: none;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .chat-input-container button:hover {
+            background: var(--color-primary-hover);
+        }
+
+        .mode-selector {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .mode-selector button {
+            flex: 1;
+            padding: 0.75rem;
+            background: var(--color-surface-elevated);
+            color: var(--color-text-secondary);
+            border: 2px solid var(--color-border);
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .mode-selector button.active {
+            background: var(--color-primary);
+            color: var(--color-bg);
+            border-color: var(--color-primary);
+        }
+
+        .help-text {
+            background: rgba(56, 189, 248, 0.1);
+            color: var(--color-primary);
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            margin-top: 1rem;
+            border: 1px solid rgba(56, 189, 248, 0.3);
+        }
+
+        @media (max-width: 768px) {
+            .login-box {
+                padding: 2rem 1.5rem;
+            }
+
+            .chat-messages {
+                padding: 1rem;
+            }
+
+            .message-content {
+                max-width: 85%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container" id="loginScreen">
+        <div class="login-box">
+            <h1>🔐 P2P Encrypted Chat</h1>
+            <p>End-to-end encrypted communication</p>
+
+            <div id="errorContainer"></div>
+            <div id="successContainer"></div>
+
+            <div class="mode-selector">
+                <button id="serverModeBtn" class="active" onclick="selectMode('server')">
+                    Server (Host)
+                </button>
+                <button id="clientModeBtn" onclick="selectMode('client')">
+                    Client (Join)
+                </button>
+            </div>
+
+            <div id="serverForm">
+                <div class="form-group">
+                    <label for="serverUsername">Your Username</label>
+                    <input type="text" id="serverUsername" placeholder="Enter your username" required>
+                </div>
+                <div class="form-group">
+                    <label for="roomPassword">Set Room Password</label>
+                    <input type="password" id="roomPassword" placeholder="Create a secure password" required>
+                </div>
+                <div class="form-group">
+                    <label for="serverPort">Port (optional)</label>
+                    <input type="number" id="serverPort" placeholder="5000" value="5000">
+                </div>
+                <button class="btn" onclick="startServer()">Create Chat Room</button>
+                <div class="help-text">
+                    💡 As host, you'll create a password-protected room. Share your IP and password with others to join.
+                </div>
+            </div>
+
+            <div id="clientForm" style="display: none;">
+                <div class="form-group">
+                    <label for="clientUsername">Your Username</label>
+                    <input type="text" id="clientUsername" placeholder="Enter your username" required>
+                </div>
+                <div class="form-group">
+                    <label for="serverHost">Server IP Address</label>
+                    <input type="text" id="serverHost" placeholder="e.g., 192.168.1.100" required>
+                </div>
+                <div class="form-group">
+                    <label for="clientPort">Port</label>
+                    <input type="number" id="clientPort" placeholder="5000" value="5000">
+                </div>
+                <button class="btn" onclick="connectToServer()">Connect to Room</button>
+                <div class="help-text">
+                    💡 Enter the host's IP address. You'll be asked for the password after connecting (3 attempts allowed).
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="chat-container" id="chatScreen">
+        <div class="chat-header">
+            <h2>Encrypted Chat Room</h2>
+            <div class="status">
+                <span class="status-dot"></span>
+                <span id="connectionStatus">Connected</span>
+            </div>
+        </div>
+        <div class="chat-messages" id="chatMessages"></div>
+        <div class="chat-input-container">
+            <input type="text" id="messageInput" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        let socket = null;
+        let currentMode = 'server';
+        let currentUsername = '';
+
+        function selectMode(mode) {
+            currentMode = mode;
+            
+            const serverBtn = document.getElementById('serverModeBtn');
+            const clientBtn = document.getElementById('clientModeBtn');
+            const serverForm = document.getElementById('serverForm');
+            const clientForm = document.getElementById('clientForm');
+
+            if (mode === 'server') {
+                serverBtn.classList.add('active');
+                clientBtn.classList.remove('active');
+                serverForm.style.display = 'block';
+                clientForm.style.display = 'none';
+            } else {
+                clientBtn.classList.add('active');
+                serverBtn.classList.remove('active');
+                clientForm.style.display = 'block';
+                serverForm.style.display = 'none';
+            }
+
+            clearMessages();
+        }
+
+        function showError(message) {
+            const container = document.getElementById('errorContainer');
+            container.innerHTML = `<div class="error-message">${message}</div>`;
+            setTimeout(() => container.innerHTML = '', 5000);
+        }
+
+        function showSuccess(message) {
+            const container = document.getElementById('successContainer');
+            container.innerHTML = `<div class="success-message">${message}</div>`;
+            setTimeout(() => container.innerHTML = '', 5000);
+        }
+
+        function clearMessages() {
+            document.getElementById('errorContainer').innerHTML = '';
+            document.getElementById('successContainer').innerHTML = '';
+        }
+
+        async function startServer() {
+            const username = document.getElementById('serverUsername').value.trim();
+            const password = document.getElementById('roomPassword').value;
+            const port = document.getElementById('serverPort').value;
+
+            if (!username) {
+                showError('Please enter a username');
+                return;
+            }
+            if (!password) {
+                showError('Please set a room password');
+                return;
+            }
+
+            currentUsername = username;
+
+            try {
+                const response = await fetch('/start_server', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password, port: parseInt(port) })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showSuccess(`Server started! Your IP: ${data.ip}`);
+                    setTimeout(() => initializeChat(), 1500);
+                } else {
+                    showError(data.error || 'Failed to start server');
+                }
+            } catch (error) {
+                showError('Connection error: ' + error.message);
+            }
+        }
+
+        async function connectToServer() {
+            const username = document.getElementById('clientUsername').value.trim();
+            const host = document.getElementById('serverHost').value.trim();
+            const port = document.getElementById('clientPort').value;
+
+            if (!username) {
+                showError('Please enter a username');
+                return;
+            }
+            if (!host) {
+                showError('Please enter server IP address');
+                return;
+            }
+
+            currentUsername = username;
+
+            try {
+                const response = await fetch('/connect_client', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, host, port: parseInt(port) })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    const password = prompt('Enter room password:');
+                    if (!password) {
+                        showError('Password is required');
+                        return;
+                    }
+
+                    const authResponse = await fetch('/authenticate', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password })
+                    });
+
+                    const authData = await authResponse.json();
+
+                    if (authData.success) {
+                        showSuccess('Authentication successful!');
+                        setTimeout(() => initializeChat(), 1500);
+                    } else {
+                        showError(authData.error || 'Authentication failed');
+                        if (authData.locked) {
+                            setTimeout(() => location.reload(), 2000);
+                        }
+                    }
+                } else {
+                    showError(data.error || 'Failed to connect');
+                }
+            } catch (error) {
+                showError('Connection error: ' + error.message);
+            }
+        }
+
+        function initializeChat() {
+            document.getElementById('loginScreen').style.display = 'none';
+            document.getElementById('chatScreen').classList.add('active');
+
+            socket = io();
+
+            socket.on('connect', () => {
+                console.log('Socket.IO connected');
+                socket.emit('join', { username: currentUsername });
+            });
+
+            socket.on('message', (data) => {
+                addMessage(data.username, data.message, data.timestamp, data.isOwn);
+            });
+
+            socket.on('system', (data) => {
+                addSystemMessage(data.message);
+            });
+
+            socket.on('disconnect', () => {
+                document.getElementById('connectionStatus').textContent = 'Disconnected';
+                addSystemMessage('Connection lost');
+            });
+
+            document.getElementById('messageInput').focus();
+        }
+
+        function addMessage(username, message, timestamp, isOwn = false) {
+            const messagesDiv = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message' + (isOwn ? ' own' : '');
+
+            const time = new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+            messageDiv.innerHTML = `
+                <div class="message-header">
+                    <span class="message-username">${escapeHtml(username)}</span>
+                    <span class="message-time">${time}</span>
+                </div>
+                <div class="message-content">${escapeHtml(message)}</div>
+            `;
+
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function addSystemMessage(message) {
+            const messagesDiv = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message system';
+
+            messageDiv.innerHTML = `
+                <div class="message-content">${escapeHtml(message)}</div>
+            `;
+
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+
+            if (!message || !socket) return;
+
+            socket.emit('message', { message });
+            input.value = '';
+            input.focus();
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
