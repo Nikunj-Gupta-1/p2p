@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Single-file P2P Encrypted Chat with GUI.
+Single-file P2P Encrypted Chat with GUI, usernames, and password gate.
 
-- Keeps original raw TCP design: server listens on a TCP port, clients connect to host:port.
-- Port-forwarding / NAT behavior is unchanged compared to the original script.
-- Multi-peer server with per-peer encrypted sessions and padding.
-- Tkinter GUI on top: no logs go to the terminal; everything is shown in the GUI.
+- Raw TCP server/client (same network model as original).
+- Server:
+  - Sets username and shared room password.
+  - Accepts multiple peers.
+  - Sees per-peer list and can send to selected peer or broadcast.
+- Client:
+  - Sets its username.
+  - Must enter correct password; 3 wrong attempts -> client app closes and server
+    receives a log message about an attack attempt from that IP.
 
 Requires:
     pip install pycryptodome
 """
 
 # =========================
-# === Original crypto + P2P logic (adapted for GUI logging) ===
+# === Crypto + P2P logic ===
 # =========================
 
 import socket
@@ -67,7 +72,6 @@ class CryptoManager:
 
     def _load_or_generate_rsa(self):
         if os.path.exists(self.key_file):
-            # Log only via GUI, so no print here
             with open(self.key_file, "rb") as f:
                 self.private_key = RSA.import_key(f.read())
         else:
@@ -103,7 +107,7 @@ class CryptoManager:
 
 class SessionCrypto:
     """
-    Per-connection crypto state: peer key, derived keys, counters, encrypt/decrypt.
+    Per-connection crypto state.
     """
     def __init__(self, identity: CryptoManager):
         self.identity = identity
@@ -192,16 +196,18 @@ def recv_framed(conn: socket.socket) -> bytes:
 
 @dataclass
 class SessionConfig:
-    packet_interval: float = 0.1   # 10 pkt/s when active
-    idle_threshold: float = 5.0    # stop padding after idle
-    dummy_len: int = 64            # bytes of dummy plaintext
+    packet_interval: float = 0.1
+    idle_threshold: float = 5.0
+    dummy_len: int = 64
 
 
 class PeerSession:
     """
-    One TCP connection <-> one peer.
+    One TCP connection <-> one peer (after password-authenticated handshake).
     """
-    def __init__(self, conn: socket.socket, addr, identity: CryptoManager, config: SessionConfig, on_message, on_log):
+    def __init__(self, conn: socket.socket, addr, identity: CryptoManager,
+                 config: SessionConfig, on_message, on_log,
+                 peer_username: str):
         self.conn = conn
         self.addr = addr
         self.identity = identity
@@ -216,13 +222,12 @@ class PeerSession:
         self.out_q = queue.Queue()
         self.last_real_sent = time.time()
 
-        self.peer_id = f"{addr[0]}:{addr[1]}"
+        self.peer_username = peer_username  # logical name
+        self.peer_id = f"{peer_username} ({addr[0]}:{addr[1]})"
 
     def log(self, msg: str):
         if self.on_log:
             self.on_log(f"[{self.peer_id}] {msg}")
-
-    # ---- handshake ----
 
     def handshake_server(self):
         send_framed(self.conn, self.identity.public_bytes(), self.send_lock)
@@ -265,8 +270,6 @@ class PeerSession:
         shared = self.identity.dh_shared(my_priv, server_pub)
         self.crypto.derive_from_shared(shared)
         self.log("Secure session established (client side).")
-
-    # ---- loops ----
 
     def start(self):
         self.running = True
@@ -335,11 +338,22 @@ class PeerSession:
 
 
 class MultiPeerServer:
-    def __init__(self, identity: CryptoManager, host="0.0.0.0", port=9999):
+    """
+    Server with username + shared password; accepts multiple peers.
+    """
+    def __init__(self, identity: CryptoManager, host="0.0.0.0", port=9999,
+                 username: str = "Server", password_plain: str | None = None):
         self.identity = identity
         self.host = host
         self.port = port
         self.cfg = SessionConfig()
+
+        self.username = username
+        self.password_hash = None
+        if password_plain:
+            # HMAC-SHA256(password, salt) – simple keyed hash
+            salt = b"p2pchat-room"
+            self.password_hash = hmac.new(salt, password_plain.encode(), hashlib.sha256).hexdigest()
 
         self.sock = None
         self.running = False
@@ -347,13 +361,20 @@ class MultiPeerServer:
         self.sessions: dict[str, PeerSession] = {}
         self.sessions_lock = threading.Lock()
 
-        # Hooks for GUI:
         self.on_log = None
         self.on_peer_list_changed = None
 
     def log(self, text: str):
         if self.on_log:
             self.on_log(text)
+
+    def _check_password(self, received_plain: str) -> bool:
+        if self.password_hash is None:
+            # No password set => allow all
+            return True
+        salt = b"p2pchat-room"
+        trial = hmac.new(salt, received_plain.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(trial, self.password_hash)
 
     def start(self):
         self.running = True
@@ -362,8 +383,8 @@ class MultiPeerServer:
         self.sock.bind((self.host, self.port))
         self.sock.listen(50)
 
-        self.log(f"[*] Server listening on {self.host}:{self.port}")
-        self.log("[*] Accepting multiple peers. Select a peer to send direct messages.")
+        self.log(f"[*] Server '{self.username}' listening on {self.host}:{self.port}")
+        self.log("[*] Waiting for clients (they must provide correct password).")
 
         threading.Thread(target=self._accept_loop, daemon=True).start()
 
@@ -373,37 +394,74 @@ class MultiPeerServer:
                 conn, addr = self.sock.accept()
             except OSError:
                 break
-            threading.Thread(target=self._handle_new_peer, args=(conn, addr), daemon=True).start()
+            threading.Thread(target=self._auth_and_handle_peer, args=(conn, addr), daemon=True).start()
 
-    def _handle_new_peer(self, conn, addr):
-        def on_msg(peer_id, msg):
-            self.log(f"{peer_id} says: {msg}")
-
-        session = PeerSession(conn, addr, self.identity, self.cfg, on_msg, self.on_log)
+    def _auth_and_handle_peer(self, conn, addr):
+        ip = addr[0]
         try:
-            session.handshake_server()
+            # 1) Receive username (UTF-8, framed).
+            uname_bytes = recv_framed(conn)
+            peer_username = uname_bytes.decode("utf-8", errors="replace") or f"{ip}"
+
+            # 2) Password attempts (max 3).
+            attempts = 0
+            authenticated = False
+            while attempts < 3:
+                pass_bytes = recv_framed(conn)
+                password = pass_bytes.decode("utf-8", errors="replace")
+                if self._check_password(password):
+                    authenticated = True
+                    send_framed(conn, b"OK")
+                    break
+                else:
+                    attempts += 1
+                    if attempts >= 3:
+                        send_framed(conn, b"LOCKED")
+                        self.log(f"[!] Password attack suspected from {ip}: 3 failed attempts.")
+                        conn.close()
+                        return
+                    else:
+                        send_framed(conn, b"FAIL")
+
+            if not authenticated:
+                conn.close()
+                return
+
+            # 3) Proceed to crypto handshake + session.
+            def on_msg(peer_id, msg):
+                self.log(f"{peer_id} says: {msg}")
+
+            session = PeerSession(conn, addr, self.identity, self.cfg, on_msg, self.on_log, peer_username)
+            try:
+                session.handshake_server()
+            except Exception as e:
+                self.log(f"[!] Handshake error from {addr}: {e}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+            with self.sessions_lock:
+                self.sessions[session.peer_id] = session
+
+            self.log(f"[+] {peer_username} connected from {ip}")
+            if self.on_peer_list_changed:
+                self.on_peer_list_changed(list(self.sessions.keys()))
+            session.start()
         except Exception as e:
-            self.log(f"[!] Handshake error from {addr}: {e}")
+            self.log(f"[!] Error during auth/accept from {ip}: {e}")
             try:
                 conn.close()
             except Exception:
                 pass
-            return
-
-        with self.sessions_lock:
-            self.sessions[session.peer_id] = session
-
-        self.log(f"[+] Peer connected: {session.peer_id}")
-        if self.on_peer_list_changed:
-            self.on_peer_list_changed(list(self.sessions.keys()))
-        session.start()
 
     def broadcast(self, text: str):
         with self.sessions_lock:
             dead = []
             for peer_id, sess in self.sessions.items():
                 if sess.running:
-                    sess.enqueue_message(text)
+                    sess.enqueue_message(f"{self.username} (broadcast): {text}")
                 else:
                     dead.append(peer_id)
             for peer_id in dead:
@@ -415,7 +473,7 @@ class MultiPeerServer:
         with self.sessions_lock:
             sess = self.sessions.get(peer_id)
         if sess and sess.running:
-            sess.enqueue_message(text)
+            sess.enqueue_message(f"{self.username}: {text}")
         else:
             self.log(f"[!] Peer {peer_id} not available.")
 
@@ -425,7 +483,6 @@ class MultiPeerServer:
             for sess in list(self.sessions.values()):
                 sess.stop()
             self.sessions.clear()
-
         try:
             if self.sock:
                 self.sock.close()
@@ -438,16 +495,24 @@ class MultiPeerServer:
 
 
 class SimpleClient:
-    def __init__(self, identity: CryptoManager, host: str, port: int = 9999):
+    """
+    Client with username and 3-attempt password auth.
+    """
+    def __init__(self, identity: CryptoManager, host: str, port: int,
+                 username: str, password: str):
         self.identity = identity
         self.host = host
         self.port = port
         self.cfg = SessionConfig()
 
+        self.username = username
+        self.password = password
+
         self.session: PeerSession | None = None
         self.on_log = None
         self.on_connected = None
         self.on_disconnected = None
+        self.on_auth_fail_3 = None  # callback when 3 attempts fail (GUI will exit)
 
     def log(self, text: str):
         if self.on_log:
@@ -457,13 +522,46 @@ class SimpleClient:
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.log(f"[*] Connecting to {self.host}:{self.port}...")
         conn.connect((self.host, self.port))
-        self.log("[✓] Connected")
+        self.log("[*] Connected, sending username and password...")
 
+        # 1) Send username
+        send_framed(conn, self.username.encode("utf-8"))
+
+        # 2) Password attempts (max 3) - we simply retry same password 3 times
+        attempts = 0
+        while attempts < 3:
+            send_framed(conn, self.password.encode("utf-8"))
+            resp = recv_framed(conn)
+            if resp == b"OK":
+                self.log("[✓] Password accepted by server.")
+                break
+            elif resp == b"FAIL":
+                attempts += 1
+                self.log(f"[!] Password rejected. Attempts used: {attempts}/3")
+                if attempts >= 3:
+                    self.log("[!] Too many failed password attempts. Closing client.")
+                    conn.close()
+                    if self.on_auth_fail_3:
+                        self.on_auth_fail_3()
+                    return
+            elif resp == b"LOCKED":
+                self.log("[!] Server locked this client after repeated failures.")
+                conn.close()
+                if self.on_auth_fail_3:
+                    self.on_auth_fail_3()
+                return
+            else:
+                self.log(f"[!] Unexpected auth response: {resp!r}")
+                conn.close()
+                return
+
+        # 3) Crypto handshake + session
         def on_msg(peer_id, msg):
-            self.log(f"Peer: {msg}")
+            self.log(f"{peer_id}: {msg}")
 
-        session = PeerSession(conn, (self.host, self.port), self.identity, self.cfg, on_msg, self.on_log)
-        session.peer_id = f"{self.host}:{self.port}"
+        session = PeerSession(conn, (self.host, self.port), self.identity, self.cfg,
+                              on_msg, self.on_log, peer_username="Server")
+        session.peer_id = f"Server ({self.host}:{self.port})"
 
         session.handshake_client()
         self.log("[✓] Secure channel established.")
@@ -483,7 +581,7 @@ class SimpleClient:
 
     def send(self, text: str):
         if self.session and self.session.running:
-            self.session.enqueue_message(text)
+            self.session.enqueue_message(f"{self.username}: {text}")
 
     def disconnect(self):
         if self.session:
@@ -502,8 +600,8 @@ class GUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("P2P Encrypted Chat (Desktop)")
-        self.geometry("1000x650")
-        self.minsize(950, 600)
+        self.geometry("1000x680")
+        self.minsize(950, 620)
 
         self.identity = CryptoManager()
         self.server: MultiPeerServer | None = None
@@ -518,7 +616,7 @@ class GUI(tk.Tk):
 
         top = ttk.Frame(self, padding=12)
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(10, weight=1)
+        top.columnconfigure(12, weight=1)
 
         self.mode = tk.StringVar(value="server")
         ttk.Label(top, text="Mode:").grid(row=0, column=0, sticky="w")
@@ -527,23 +625,31 @@ class GUI(tk.Tk):
         ttk.Radiobutton(top, text="Client", value="client", variable=self.mode,
                         command=self._refresh_mode).grid(row=0, column=2, padx=(6, 12))
 
+        self.username_var = tk.StringVar(value="ServerUser")
+        ttk.Label(top, text="Username:").grid(row=0, column=3, sticky="e")
+        ttk.Entry(top, width=15, textvariable=self.username_var).grid(row=0, column=4, sticky="w", padx=(6, 0))
+
+        self.password_var = tk.StringVar(value="")
+        ttk.Label(top, text="Password:").grid(row=0, column=5, sticky="e")
+        ttk.Entry(top, width=15, textvariable=self.password_var, show="*").grid(row=0, column=6, sticky="w", padx=(6, 0))
+
         self.port_var = tk.StringVar(value="9999")
-        ttk.Label(top, text="Port:").grid(row=0, column=3, sticky="e")
-        self.port_entry = ttk.Entry(top, width=10, textvariable=self.port_var)
-        self.port_entry.grid(row=0, column=4, sticky="w", padx=(6, 0))
+        ttk.Label(top, text="Port:").grid(row=0, column=7, sticky="e")
+        self.port_entry = ttk.Entry(top, width=8, textvariable=self.port_var)
+        self.port_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
 
         self.host_var = tk.StringVar(value="")
-        self.host_label = ttk.Label(top, text="Peer host:")
-        self.host_entry = ttk.Entry(top, width=24, textvariable=self.host_var)
+        self.host_label = ttk.Label(top, text="Server host:")
+        self.host_entry = ttk.Entry(top, width=20, textvariable=self.host_var)
 
         self.start_btn = ttk.Button(top, text="Start", command=self.start_mode)
         self.stop_btn = ttk.Button(top, text="Stop", command=self.stop_all)
-        self.start_btn.grid(row=0, column=5, padx=(16, 6))
-        self.stop_btn.grid(row=0, column=6, padx=(0, 6))
+        self.start_btn.grid(row=0, column=9, padx=(16, 6))
+        self.stop_btn.grid(row=0, column=10, padx=(0, 6))
 
         self.status = tk.StringVar(value="Stopped")
         ttk.Label(top, textvariable=self.status, foreground="#0ea5e9").grid(
-            row=1, column=0, columnspan=11, sticky="w", pady=(10, 0)
+            row=1, column=0, columnspan=13, sticky="w", pady=(10, 0)
         )
 
         main = ttk.Frame(self, padding=(12, 0, 12, 12))
@@ -552,7 +658,6 @@ class GUI(tk.Tk):
         main.columnconfigure(1, weight=1)
         main.rowconfigure(0, weight=1)
 
-        # Left: log + input
         left = ttk.Frame(main)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         left.columnconfigure(0, weight=1)
@@ -574,7 +679,6 @@ class GUI(tk.Tk):
         self.send_btn.grid(row=0, column=1, padx=(8, 0))
         self.msg_entry.bind("<Return>", lambda e: self.send_msg())
 
-        # Right: peers + info
         right = ttk.Frame(main)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
@@ -583,9 +687,9 @@ class GUI(tk.Tk):
         ttk.Label(right, text="Connected peers (server mode):").grid(row=0, column=0, sticky="w")
         self.peer_list = tk.Listbox(right, height=8, exportselection=False)
         self.peer_list.grid(row=1, column=0, sticky="nsew", pady=(4, 8))
-        self.peer_list_scroll = ttk.Scrollbar(right, orient="vertical", command=self.peer_list.yview)
-        self.peer_list.configure(yscrollcommand=self.peer_list_scroll.set)
-        self.peer_list_scroll.grid(row=1, column=1, sticky="ns")
+        self.peer_scroll = ttk.Scrollbar(right, orient="vertical", command=self.peer_list.yview)
+        self.peer_list.configure(yscrollcommand=self.peer_scroll.set)
+        self.peer_scroll.grid(row=1, column=1, sticky="ns")
 
         self.peer_mode_var = tk.StringVar(value="broadcast")
         peer_mode_frame = ttk.Frame(right)
@@ -600,17 +704,16 @@ class GUI(tk.Tk):
         self.notes.grid(row=4, column=0, sticky="nsew", pady=(4, 0))
         self.notes.insert(
             "1.0",
-            "This GUI does NOT change networking.\n"
-            "Server listens on TCP port, clients connect to host:port.\n"
-            "Port-forward that TCP port on your router for Internet use.\n\n"
-            "Server mode:\n"
-            "- Start server on chosen port.\n"
-            "- Peers appear in the list as they connect.\n"
-            "- Choose Broadcast to message all peers.\n"
-            "- Choose Selected peer to send only to one.\n\n"
-            "Client mode:\n"
-            "- Enter server public IP/hostname and port.\n"
-            "- Start and chat; messages go to the server.\n"
+            "Server:\n"
+            "- Set your username & password.\n"
+            "- Start on chosen port, forward that TCP port on router.\n\n"
+            "Client:\n"
+            "- Set your username.\n"
+            "- Enter server host and same port.\n"
+            "- Enter the same password; 3 wrong attempts close client and alert server.\n\n"
+            "Chat:\n"
+            "- Server can broadcast or send to selected peer.\n"
+            "- Client messages are tagged with client username.\n"
         )
         self.notes.configure(state="disabled")
 
@@ -625,8 +728,8 @@ class GUI(tk.Tk):
 
     def _refresh_mode(self):
         if self.mode.get() == "client":
-            self.host_label.grid(row=0, column=7, sticky="e", padx=(10, 0))
-            self.host_entry.grid(row=0, column=8, sticky="w", padx=(6, 0))
+            self.host_label.grid(row=0, column=11, sticky="e", padx=(10, 0))
+            self.host_entry.grid(row=0, column=12, sticky="w", padx=(6, 0))
         else:
             self.host_label.grid_forget()
             self.host_entry.grid_forget()
@@ -643,6 +746,9 @@ class GUI(tk.Tk):
             self.peer_list.insert("end", p)
 
     def start_mode(self):
+        username = self.username_var.get().strip() or "User"
+        password = self.password_var.get()
+
         try:
             port = int(self.port_var.get().strip() or "9999")
         except ValueError:
@@ -653,21 +759,34 @@ class GUI(tk.Tk):
         self.stop_all()
 
         if mode == "server":
-            self.server = MultiPeerServer(self.identity, port=port)
+            if not password:
+                if not messagebox.askyesno(
+                    "No password",
+                    "No password set. Any client can connect.\n\nContinue anyway?"
+                ):
+                    return
+            self.server = MultiPeerServer(self.identity, port=port,
+                                          username=username,
+                                          password_plain=password if password else None)
             self.server.on_log = lambda s: self.after(0, self._append_log, s)
             self.server.on_peer_list_changed = lambda peers: self.after(0, self._update_peer_list, peers)
             self.server.start()
-            self.status.set(f"Server running on 0.0.0.0:{port}. Forward this TCP port for WAN.")
+            self.status.set(f"Server '{username}' running on 0.0.0.0:{port}.")
             self._set_running(True)
         else:
             host = self.host_var.get().strip()
             if not host:
-                messagebox.showerror("Missing host", "Enter the peer/server host (public IP or hostname).")
+                messagebox.showerror("Missing host", "Enter the server host (public IP or hostname).")
                 return
-            self.client = SimpleClient(self.identity, host, port=port)
+            if not password:
+                messagebox.showerror("Missing password", "Client must provide server password.")
+                return
+            self.client = SimpleClient(self.identity, host, port=port,
+                                       username=username, password=password)
             self.client.on_log = lambda s: self.after(0, self._append_log, s)
             self.client.on_connected = lambda: self.after(0, self.status.set, f"Connected to {host}:{port}.")
             self.client.on_disconnected = lambda: self.after(0, self.status.set, "Disconnected.")
+            self.client.on_auth_fail_3 = self._client_auth_lockout
             try:
                 self.client.connect_once()
             except Exception as e:
@@ -677,6 +796,14 @@ class GUI(tk.Tk):
                 self.client = None
                 return
             self._set_running(True)
+
+    def _client_auth_lockout(self):
+        # Called from client thread after 3 failed attempts
+        def _do():
+            self._append_log("[!] Client is shutting down after 3 failed password attempts.")
+            self.stop_all()
+            self.destroy()
+        self.after(0, _do)
 
     def send_msg(self):
         text = self.msg_var.get()
