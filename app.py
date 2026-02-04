@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-P2P Encrypted Chat - Flask Backend
+P2P Encrypted Chat - Flask Backend (Fixed for multi-computer use)
 Features: Password authentication with 3-strike system, username management, AES-256 encryption
+Run on SERVER computer, clients connect via server's IP address
 """
 
 from flask import Flask, render_template, request, session, jsonify
 from flask_socketio import SocketIO, emit, join_room, disconnect
+from flask_cors import CORS
 from datetime import datetime
 import hashlib
 import hmac
@@ -17,7 +19,14 @@ from Crypto.Util.Padding import pad, unpad
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = secrets.token_hex(32)
-socketio = SocketIO(app, cors_allowed_origins="*")
+
+# CRITICAL FIX: Enable CORS for cross-origin connections
+CORS(app)
+socketio = SocketIO(app, 
+                    cors_allowed_origins="*",
+                    async_mode='threading',
+                    logger=True,
+                    engineio_logger=True)
 
 server_state = {
     'password_hash': None,
@@ -129,6 +138,7 @@ def start_server():
     session['authenticated'] = True
     session['is_server'] = True
     
+    # Get actual local IP address
     try:
         s = sock.socket(sock.AF_INET, sock.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -276,12 +286,34 @@ def handle_disconnect():
         print(f"[*] User {username} disconnected")
 
 
+def get_local_ip():
+    """Get the local network IP address"""
+    try:
+        s = sock.socket(sock.AF_INET, sock.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return '127.0.0.1'
+
+
 if __name__ == '__main__':
     print("="*60)
-    print("  P2P ENCRYPTED CHAT - Web Application")
+    print("  P2P ENCRYPTED CHAT - Server Application")
     print("="*60)
-    print("\n[*] Starting server...")
-    print("[*] Open http://localhost:5000 in your browser")
-    print("[*] Press Ctrl+C to stop\n")
     
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
+    local_ip = get_local_ip()
+    
+    print(f"\n[*] Starting server on {local_ip}:5000")
+    print(f"\n[SERVER SETUP]")
+    print(f"  • Open http://localhost:5000 on THIS computer")
+    print(f"  • Select 'Start as Server' mode")
+    print(f"\n[CLIENT SETUP]")
+    print(f"  • On OTHER computers, open http://{local_ip}:5000")
+    print(f"  • Select 'Connect as Client' mode")
+    print(f"  • Enter server address: {local_ip}:5000")
+    print(f"\n[*] Press Ctrl+C to stop\n")
+    
+    # CRITICAL: Bind to 0.0.0.0 to accept connections from other computers
+    socketio.run(app, host='0.0.0.0', port=5050, debug=False, allow_unsafe_werkzeug=True)
